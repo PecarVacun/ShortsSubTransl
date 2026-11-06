@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "subtitle-localization-pipeline"
+version = "0.1.0"
+description = "Modular screenplay-aware subtitle localization pipeline"
+requires-python = ">=3.9"
+dependencies = [
+    "deepl>=1.18,<2",
+    "gradio>=4.0,<5",
+    "huggingface-hub>=0.19.3,<1",
+    "PyMuPDF>=1.24,<2",
+    "pysrt>=1.1.2,<2",
+    "python-dotenv>=1.0,<2",
+    "requests>=2.31,<3",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<9"]
+
+[tool.setuptools]
+py-modules = ["config"]
+
+[tool.setuptools.packages.find]
+include = ["core*", "services*", "ui*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
