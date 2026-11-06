@@ -1,0 +1,527 @@
+import os
+import re
+import json
+import shlex
+import base64
+import hashlib
+from io import BytesIO
+from pathlib import Path
+from datetime import datetime
+
+import requests
+import fitz  # PyMuPDF для работы с PDF
+from pptx import Presentation
+from pptx.enum.shapes import MSO_SHAPE_TYPE
+from PIL import Image
+
+# ================= НАСТРОЙКИ =================
+OLLAMA_URL = "http://localhost:11434/api/generate"
+VISION_MODEL = "llama3.2-vision"  # Можно заменить на gemma3:12b или minicpm-v
+TEXT_MODEL = "llama3.2-vision"    # Модель для логической группировки файлов
+MIN_IMAGE_WIDTH = 150             # Игнорировать мелкие иконки и логотипы (ширина в px)
+MIN_IMAGE_HEIGHT = 150            # Игнорировать мелкие иконки и логотипы (высота в px)
+OUTPUT_DIR_NAME = "Knowledge_Base_Output"
+# =============================================
+
+
+def clean_macos_path(raw_input: str) -> Path:
+    """Очищает путь после Drag-and-Drop папки из Finder в Терминал macOS."""
+    cleaned = raw_input.strip()
+    try:
+        parts = shlex.split(cleaned)
+        if parts:
+            cleaned = parts[0]
+    except ValueError:
+        cleaned = cleaned.strip("'\"")
+    return Path(cleaned).expanduser().resolve()
+
+
+def check_ollama() -> bool:
+    """Проверяет, запущен ли локальный сервер Ollama."""
+    try:
+        r = requests.get("http://localhost:11434/api/tags", timeout=5)
+        return r.status_code == 200
+    except requests.RequestException:
+        return False
+
+
+def call_ollama(prompt: str, image_bytes: bytes = None, model: str = TEXT_MODEL) -> str:
+    """Отправляет запрос в локальную модель Ollama (текст или текст + картинка)."""
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {"temperature": 0.2}
+    }
+    if image_bytes:
+        b64_img = base64.b64encode(image_bytes).decode("utf-8")
+        payload["images"] = [b64_img]
+
+    try:
+        response = requests.post(OLLAMA_URL, json=payload, timeout=300)
+        response.raise_for_status()
+        return response.json().get("response", "").strip()
+    except Exception as e:
+        return f"[Ошибка генерации описания моделью: {e}]"
+
+
+def describe_screenshot(image_bytes: bytes, doc_name: str, slide_num: int, slide_text: str) -> str:
+    """Запрашивает у локальной VLM подробное описание скриншота с учетом контекста слайда."""
+    prompt = f"""Ты — технический писатель и эксперт по корпоративному ПО.
+Перед тобой изображение (скриншот интерфейса или схема) из презентации "{doc_name}", слайд №{slide_num}.
+
+Текстовый контекст этого слайда:
+\"\"\"
+{slide_text if slide_text.strip() else "Текст на слайде отсутствует"}
+\"\"\"
+
+Задача: максимально подробно, четко и понятно опиши этот скриншот на русском языке, связывая визуальные элементы с текстом слайда.
+1. Укажи, какое окно, модуль или меню программы изображено.
+2. Если на скриншоте есть цифровые метки (1, 2, 3...), стрелки, рамки или выделения — подробно расшифруй, на какие именно кнопки, поля или области экрана они указывают.
+3. Перечисли ключевые поля ввода, таблицы, вкладки и значения, которые видны на экране.
+Пиши сразу по делу, структурированно, без вводных фраз."""
+    return call_ollama(prompt, image_bytes=image_bytes, model=VISION_MODEL)
+
+
+def save_valid_image(img_bytes: bytes, seen_hashes: set, screenshots_dir: Path, img_id: str) -> Path | None:
+    """Фильтрует мелкие иконки/дубликаты и сохраняет уникальный скриншот в PNG."""
+    img_hash = hashlib.md5(img_bytes).hexdigest()
+    if img_hash in seen_hashes:
+        return None
+
+    try:
+        with Image.open(BytesIO(img_bytes)) as img:
+            width, height = img.size
+            if width < MIN_IMAGE_WIDTH or height < MIN_IMAGE_HEIGHT:
+                return None
+            seen_hashes.add(img_hash)
+            out_path = screenshots_dir / f"{img_id}.png"
+            img.convert("RGB").save(out_path, format="PNG")
+            return out_path
+    except Exception:
+        return None
+
+
+def extract_shapes_recursive(shapes, texts: list, images: list):
+    """Рекурсивно извлекает текст, таблицы и картинки (включая сгруппированные элементы) из слайда PPTX."""
+    for shape in shapes:
+        if shape.has_text_frame:
+            for p in shape.text_frame.paragraphs:
+                t = p.text.strip()
+                if t:
+                    texts.append(t)
+        elif shape.has_table:
+            for row in shape.table.rows:
+                row_text = [cell.text.strip().replace("\n", " ") for cell in row.cells]
+                if any(row_text):
+                    texts.append(" | ".join(row_text))
+        elif shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+            try:
+                images.append(shape.image.blob)
+            except Exception:
+                pass
+        elif shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+            extract_shapes_recursive(shape.shapes, texts, images)
+
+
+def process_pptx(file_path: Path, screenshots_dir: Path, global_img_counter: list, seen_hashes: set, screenshots_registry: list) -> dict:
+    """Обрабатывает файл .pptx и возвращает структуру данных для Markdown."""
+    prs = Presentation(file_path)
+    slides_data = []
+
+    for idx, slide in enumerate(prs.slides, start=1):
+        print(f"  -> Обработка слайда {idx}/{len(prs.slides)}...")
+        texts, raw_images = [], []
+        extract_shapes_recursive(slide.shapes, texts, raw_images)
+
+        # Заметки докладчика
+        if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
+            notes = slide.notes_slide.notes_text_frame.text.strip()
+            if notes:
+                texts.append(f"**Заметки к слайду:** {notes}")
+
+        slide_text_combined = "\n".join(f"- {t}" for t in texts)
+        slide_screenshots = []
+
+        for img_bytes in raw_images:
+            next_num = global_img_counter[0] + 1
+            img_id = f"IMG_{next_num:04d}"
+            saved_path = save_valid_image(img_bytes, seen_hashes, screenshots_dir, img_id)
+            if saved_path:
+                global_img_counter[0] = next_num
+                print(f"     [VLM] Анализ скриншота {img_id}...")
+                desc = describe_screenshot(img_bytes, file_path.name, idx, slide_text_combined)
+                rel_img_path = f"../screenshots/{saved_path.name}"
+                img_entry = {
+                    "id": img_id,
+                    "file_name": saved_path.name,
+                    "rel_path": rel_img_path,
+                    "source_doc": file_path.name,
+                    "slide_num": idx,
+                    "slide_context": " ".join(texts)[:300],
+                    "description": desc
+                }
+                slide_screenshots.append(img_entry)
+                screenshots_registry.append(img_entry)
+
+        slides_data.append({
+            "slide_num": idx,
+            "text": slide_text_combined,
+            "screenshots": slide_screenshots
+        })
+
+    return {"doc_name": file_path.name, "slides": slides_data}
+
+
+def process_pdf(file_path: Path, screenshots_dir: Path, global_img_counter: list, seen_hashes: set, screenshots_registry: list) -> dict:
+    """Обрабатывает файл .pdf (извлекает текст и рендерит слайды с графикой целиком, чтобы сохранить выноски/стрелки)."""
+    doc = fitz.open(file_path)
+    slides_data = []
+
+    for idx, page in enumerate(doc, start=1):
+        print(f"  -> Обработка страницы PDF {idx}/{len(doc)}...")
+        raw_text = page.get_text("text").strip()
+        lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+        slide_text_combined = "\n".join(f"- {line}" for line in lines)
+
+        slide_screenshots = []
+        image_list = page.get_images(full=True)
+
+        # Если на странице PDF есть изображения, делаем снимок страницы целиком (сохраняет цифры/стрелки поверх скриншотов)
+        if image_list:
+            pix = page.get_pixmap(dpi=150)
+            img_bytes = pix.tobytes("png")
+            next_num = global_img_counter[0] + 1
+            img_id = f"IMG_{next_num:04d}"
+            saved_path = save_valid_image(img_bytes, seen_hashes, screenshots_dir, img_id)
+
+            if saved_path:
+                global_img_counter[0] = next_num
+                print(f"     [VLM] Анализ визуального слайда {img_id}...")
+                desc = describe_screenshot(img_bytes, file_path.name, idx, slide_text_combined)
+                rel_img_path = f"../screenshots/{saved_path.name}"
+                img_entry = {
+                    "id": img_id,
+                    "file_name": saved_path.name,
+                    "rel_path": rel_img_path,
+                    "source_doc": file_path.name,
+                    "slide_num": idx,
+                    "slide_context": " ".join(lines)[:300],
+                    "description": desc
+                }
+                slide_screenshots.append(img_entry)
+                screenshots_registry.append(img_entry)
+
+        slides_data.append({
+            "slide_num": idx,
+            "text": slide_text_combined,
+            "screenshots": slide_screenshots
+        })
+
+    return {"doc_name": file_path.name, "slides": slides_data}
+
+
+def build_markdown_for_doc(doc_data: dict, img_prefix: str = "../screenshots/") -> str:
+    """Формирует Markdown-контент для одного документа."""
+    lines = [f"# Документ: {doc_data['doc_name']}\n"]
+    for slide in doc_data["slides"]:
+        lines.append(f"## Слайд {slide['slide_num']}\n")
+        if slide["text"]:
+            lines.append("### Текст слайда")
+            lines.append(slide["text"] + "\n")
+        if slide["screenshots"]:
+            lines.append("### Визуальные материалы и скриншоты")
+            for sc in slide["screenshots"]:
+                img_link = f"{img_prefix}{sc['file_name']}"
+                lines.append(f"#### Скриншот [{sc['id']}]({img_link})")
+                lines.append(f"![{sc['id']}]({img_link})\n")
+                lines.append(f"**Подробное описание экрана ({sc['id']}):**\n{sc['description']}\n")
+    return "\n".join(lines)
+
+
+def group_documents_semantically(docs_metadata: list) -> list:
+    """Группирует презентации по смыслу в тематические разделы с помощью локальной модели."""
+    print("\n[AI] Анализ тем и логическая группировка файлов...")
+    catalog_lines = []
+    for item in docs_metadata:
+        catalog_lines.append(f"- Файл: \"{item['doc_name']}\" | Краткое содержание: {item['preview']}")
+    catalog_text = "\n".join(catalog_lines)
+
+    prompt = f"""У нас есть набор обучающих презентаций по программному комплексу:
+{catalog_text}
+
+Сгруппируй эти файлы по смыслу в логические тематические разделы (от 3 до 8 разделов в зависимости от тем).
+Каждый файл из списка должен попасть ровно в один раздел.
+Ответь СТРОГО в формате валидного JSON-массива без лишнего текста:
+[
+  {{
+    "group_slug": "01_Основы_и_Интерфейс",
+    "group_title": "Основы работы и пользовательский интерфейс",
+    "group_summary": "Краткое описание того, о чем этот модуль (1-2 предложения).",
+    "files": ["имя_файла_1.pptx", "имя_файла_2.pdf"]
+  }}
+]"""
+
+    raw_response = call_ollama(prompt, model=TEXT_MODEL)
+    match = re.search(r"\[.*\]", raw_response, re.DOTALL)
+    if match:
+        try:
+            groups = json.loads(match.group(0))
+            # Проверка, что все файлы распределены
+            assigned = {f for g in groups for f in g.get("files", [])}
+            all_files = {d["doc_name"] for d in docs_metadata}
+            missing = list(all_files - assigned)
+            if missing:
+                groups.append({
+                    "group_slug": f"{len(groups)+1:02d}_Дополнительные_материалы",
+                    "group_title": "Дополнительные модули и материалы",
+                    "group_summary": "Прочие презентации, не вошедшие в основные категории.",
+                    "files": missing
+                })
+            return groups
+        except Exception as e:
+            print(f"[!] Ошибка разбора JSON группировки ({e}), использую автоматическое объединение.")
+
+    # Резервная группировка, если модель вернула некорректный JSON
+    return [{
+        "group_slug": "01_Полная_база_знаний",
+        "group_title": "Полная база знаний по всем презентациям",
+        "group_summary": "Объединенная документация по всем презентациям курса.",
+        "files": [d["doc_name"] for d in docs_metadata]
+    }]
+
+
+def main():
+    print("=" * 65)
+    print(" МАСТЕР КОНВЕРТАЦИИ ПРЕЗЕНТАЦИЙ В БАЗУ ЗНАНИЙ (Mac mini M2)")
+    print("=" * 65)
+
+    if not check_ollama():
+        print("\n[ОШИБКА] Сервер Ollama не запущен или недоступен!")
+        print("Запустите приложение Ollama или выполните в терминале: ollama serve")
+        print(f"Также убедитесь, что скачана модель: ollama pull {VISION_MODEL}")
+        return
+
+    raw_path = input("\nПеретяните папку с презентациями (.pptx / .pdf) в окно Терминала и нажмите Enter:\n> ")
+    source_dir = clean_macos_path(raw_path)
+
+    if not source_dir.exists() or not source_dir.is_dir():
+        print(f"\n[ОШИБКА] Папка не найдена: {source_dir}")
+        return
+
+    # Поиск всех файлов .pptx и .pdf
+    files = sorted([
+        p for p in source_dir.rglob("*")
+        if p.is_file() and p.suffix.lower() in (".pptx", ".pdf") and not p.name.startswith("~$")
+    ])
+
+    if not files:
+        print("\n[!] В указанной папке не найдено файлов .pptx или .pdf.")
+        print("Совет: если у вас старые файлы .ppt, пересохраните их в .pptx или .pdf.")
+        return
+
+    print(f"\nНайдено файлов для обработки: {len(files)}")
+
+    # Создание структуры выходных папок
+    out_root = source_dir / OUTPUT_DIR_NAME
+    raw_md_dir = out_root / "raw_md"
+    grouped_md_dir = out_root / "grouped_md"
+    screenshots_dir = out_root / "screenshots"
+
+    for d in (out_root, raw_md_dir, grouped_md_dir, screenshots_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+    global_img_counter = [0]
+    seen_hashes = set()
+    screenshots_registry = []
+    processed_docs = {}
+    docs_metadata = []
+
+    # Шаг 3 и 4: Обработка каждого файла и создание индивидуальных MD
+    for idx, file_path in enumerate(files, start=1):
+        print(f"\n[{idx}/{len(files)}] Обработка файла: {file_path.name}")
+        try:
+            if file_path.suffix.lower() == ".pptx":
+                doc_data = process_pptx(file_path, screenshots_dir, global_img_counter, seen_hashes, screenshots_registry)
+            else:
+                doc_data = process_pdf(file_path, screenshots_dir, global_img_counter, seen_hashes, screenshots_registry)
+
+            safe_stem = re.sub(r"[^\w\-_.]", "_", file_path.stem)
+            raw_md_filename = f"{safe_stem}.md"
+            raw_md_path = raw_md_dir / raw_md_filename
+
+            md_content = build_markdown_for_doc(doc_data, img_prefix="../screenshots/")
+            raw_md_path.write_text(md_content, encoding="utf-8")
+
+            # Собираем краткое превью текста для логической группировки
+            sample_text = " ".join(s["text"] for s in doc_data["slides"][:5])[:400].replace("\n", " ")
+            processed_docs[file_path.name] = {
+                "doc_data": doc_data,
+                "raw_md_filename": raw_md_filename
+            }
+            docs_metadata.append({
+                "doc_name": file_path.name,
+                "preview": sample_text
+            })
+        except Exception as e:
+            print(f"  [!] Ошибка при обработке {file_path.name}: {e}")
+
+    # Шаг 5: Смысловое объединение в тематические MD-файлы
+    groups = group_documents_semantically(docs_metadata)
+    grouped_files_info = []
+
+    for g_idx, group in enumerate(groups, start=1):
+        slug = re.sub(r"[^\w\-_]", "_", group.get("group_slug", f"Group_{g_idx:02d}"))
+        group_filename = f"{slug}.md"
+        group_path = grouped_md_dir / group_filename
+        group_title = group.get("group_title", slug)
+        group_summary = group.get("group_summary", "")
+        group_files = group.get("files", [])
+
+        merged_lines = [
+            f"# Раздел: {group_title}\n",
+            f"**Описание раздела:** {group_summary}\n",
+            "**Включенные презентации:**",
+        ]
+        for gf in group_files:
+            merged_lines.append(f"- `{gf}`")
+        merged_lines.append("\n")
+
+        valid_files = []
+        for gf in group_files:
+            if gf in processed_docs:
+                valid_files.append(gf)
+                doc_md = build_markdown_for_doc(processed_docs[gf]["doc_data"], img_prefix="../screenshots/")
+                merged_lines.append(doc_md)
+                merged_lines.append("\n")
+
+        if valid_files:
+            group_path.write_text("\n".join(merged_lines), encoding="utf-8")
+            grouped_files_info.append({
+                "title": group_title,
+                "filename": group_filename,
+                "summary": group_summary,
+                "source_files": valid_files
+            })
+
+    # Шаг 5.1 (Часть А): Создание SCREENSHOTS_INDEX.md
+    sc_lines = [
+        "# Индексный реестр всех распознанных скриншотов\n",
+        "Этот файл содержит полный каталог скриншотов и визуальных схем, извлеченных из презентаций. "
+        "Используйте уникальный идентификатор (`IMG_XXXX`), чтобы найти нужный экран или запросить вывод изображения.\n"
+    ]
+    for sc in screenshots_registry:
+        img_rel = f"screenshots/{sc['file_name']}"
+        sc_lines.append(f"## [{sc['id']}] — {sc['source_doc']} (Слайд {sc['slide_num']})")
+        sc_lines.append(f"- **Файл изображения:** `{img_rel}`")
+        sc_lines.append(f"- **Контекст слайда:** {sc['slide_context']}")
+        sc_lines.append(f"- **Описание интерфейса:**\n{sc['description']}\n")
+        sc_lines.append(f"![{sc['id']}]({img_rel})\n")
+
+    (out_root / "SCREENSHOTS_INDEX.md").write_text("\n".join(sc_lines), encoding="utf-8")
+
+    # Шаг 5.1 (Часть Б): Создание корневого 00_MASTER_INDEX.md для первого чтения моделью
+    master_lines = [
+        "# Корневой навигатор базы знаний (MASTER INDEX)\n",
+        f"*Дата генерации: {datetime.now().strftime('%Y-%m-%d %H:%M')}*\n",
+        "## Инструкция для ИИ-модели (Прочитать в первую очередь)\n",
+        "Этот документ является корневой точкой входа в документацию системы. "
+        "Вся информация из исходных презентаций (текст слайдов, заметки и детальные описания скриншотов) "
+        "структурирована на трех уровнях:\n",
+        "1. **Тематические сводные модули (`grouped_md/`)** — объединенные по смыслу файлы, которые в сумме содержат 100% информации из всех презентаций.",
+        "2. **Индивидуальные файлы презентаций (`raw_md/`)** — пофайловые копии каждой отдельной презентации.",
+        "3. **Реестр скриншотов (`SCREENSHOTS_INDEX.md` и папка `screenshots/`)** — база всех визуальных экранов с привязкой по ID (`IMG_0001` и т.д.).\n",
+        "## 1. Карта тематических модулей (Основной источник знаний)\n"
+    ]
+
+    for g_info in grouped_files_info:
+        master_lines.append(f"### [{g_info['title']}](grouped_md/{g_info['filename']})")
+        master_lines.append(f"- **Путь к файлу:** `grouped_md/{g_info['filename']}`")
+        master_lines.append(f"- **О чем этот модуль:** {g_info['summary']}")
+        master_lines.append(f"- **Содержит презентации:** {', '.join(f'`{x}`' for x in g_info['source_files'])}\n")
+
+    master_lines.append("## 2. Индекс отдельных файлов презентаций (`raw_md/`)\n")
+    for doc_name, info in processed_docs.items():
+        slides_count = len(info["doc_data"]["slides"])
+        master_lines.append(f"- **[{doc_name}](raw_md/{info['raw_md_filename']})** — слайдов: {slides_count}, файл: `raw_md/{info['raw_md_filename']}`")
+
+    master_lines.append("\n## 3. Работа со скриншотами\n")
+    master_lines.append(
+        f"Всего распознано и проиндексировано уникальных экранов: **{len(screenshots_registry)}**. "
+        "Полный перечень с визуальными описаниями и путями к PNG-файлам находится в документе "
+        "[SCREENSHOTS_INDEX.md](SCREENSHOTS_INDEX.md)."
+    )
+
+    (out_root / "00_MASTER_INDEX.md").write_text("\n".join(master_lines), encoding="utf-8")
+
+    # Шаг 6: Создание README.md с описанием структуры и рекомендованными промтами
+    readme_content = f"""# Документация и база знаний по системе (AI-Ready)
+
+В этой папке собрана автоматически оцифрованная и обогащенная база знаний, созданная из **{len(processed_docs)}** презентаций и содержащая детальные описания **{len(screenshots_registry)}** скриншотов интерфейса.
+
+## Структура файлов
+
+* **`00_MASTER_INDEX.md`** — главный корневой файл-оглавление. Загружайте его первым при работе с любой LLM или агентом: он объясняет модели архитектуру базы знаний и дает прямые ссылки на тематические разделы.
+* **`grouped_md/`** — **главная папка для загрузки в источники блокнота (NotebookLM / Claude / OpenWebUI)**. Здесь презентации логически объединены по смыслу в несколько крупных файлов без потери деталей.
+* **`SCREENSHOTS_INDEX.md`** — полный каталог всех распознанных скриншотов с их ID (`IMG_0001`, `IMG_0002`...), текстовым разбором элементов управления и путями к картинкам в папке `screenshots/`.
+* **`raw_md/`** — индивидуальные Markdown-файлы для каждой исходной презентации один-к-одному.
+* **`screenshots/`** — оригинальные изображения экранов в формате PNG.
+
+## Как загружать файлы в блокнот (NotebookLM / RAG-системы)
+
+Чтобы не превышать лимит количества источников и дать модели идеальный контекст, загрузите в источники:
+1. Файл `00_MASTER_INDEX.md`
+2. Все файлы из папки `grouped_md/`
+3. Файл `SCREENSHOTS_INDEX.md`
+
+## Рекомендуемые промты для работы с моделями
+
+### 1. Системный промт (System Prompt для настройки ассистента/блокнота)
+Скопируйте этот текст в системную инструкцию вашего блокнота или ИИ-ассистента:
+
+Начало промта:
+Ты — опытный наставник и ведущий специалист по поддержке корпоративной системы. Твоя задача — помогать новым сотрудникам быстро и безошибочно разбираться в работе программы на основе загруженной базы знаний.
+Правила работы:
+1. В начале работы изучи `00_MASTER_INDEX.md`, чтобы ориентироваться в модулях системы.
+2. Отвечай четко, пошагово и с опорой исключительно на источники.
+3. При объяснении действий в интерфейсе всегда указывай точный маршрут навигации (например: Главное меню -> Раздел -> Вкладка -> Кнопка) и названия полей на языке оригинала интерфейса.
+4. Если к шагу относится конкретный скриншот из базы, обязательно указывай его идентификатор (например, `[IMG_0003]`) и путь к файлу из `SCREENSHOTS_INDEX.md`, чтобы пользователь мог открыть изображение.
+5. Если информации нет в базе знаний, прямо скажи об этом, не выдумывая функции интерфейса.
+Конец промта.
+
+### 2. Стартовый промт для нового сотрудника (первое знакомство)
+Используйте этот запрос для начала обучения:
+
+Начало промта:
+Прочитай корневой файл `00_MASTER_INDEX.md` и тематические модули. Составь для меня (нового сотрудника) структурированный план введения в систему:
+1. Из каких основных модулей и рабочих областей состоит программа?
+2. В каком порядке мне лучше изучать разделы?
+3. Какие базовые правила навигации и горячие клавиши нужно знать в первую очередь?
+Конец промта.
+
+### 3. Промт для разбора конкретного экрана или поиска скриншота
+Используйте этот запрос, когда нужно понять, как выглядит окно или где находится нужная кнопка:
+
+Начало промта:
+Мне нужно разобраться, как работать с разделом [укажите тему или название окна].
+1. Опиши пошагово, как открыть это окно и какие поля в нем нужно заполнить.
+2. Найди в `SCREENSHOTS_INDEX.md` все скриншоты, которые относятся к этому процессу, укажи их ID (`IMG_XXXX`), пути к файлам и подробно расшифруй все элементы, отмеченные на этих скриншотах.
+Конец промта.
+"""
+
+    (out_root / "README.md").write_text(readme_content, encoding="utf-8")
+
+    print("\n" + "=" * 65)
+    print(" ГОТОВО! База знаний успешно сформирована.")
+    print("=" * 65)
+    print(f"Папка с результатами: {out_root}")
+    print(f" - Корневой индекс:    {out_root / '00_MASTER_INDEX.md'}")
+    print(f" - Реестр скриншотов:  {out_root / 'SCREENSHOTS_INDEX.md'}")
+    print(f" - Инструкция и промты:{out_root / 'README.md'}")
+    print(f" - Сводные модули:     {grouped_md_dir} ({len(grouped_files_info)} файлов)")
+    print(f" - Пофайловые MD:      {raw_md_dir} ({len(processed_docs)} файлов)")
+    print(f" - Скриншоты (PNG):    {screenshots_dir} ({len(screenshots_registry)} изображений)")
+
+
+if __name__ == "__main__":
+    main()
